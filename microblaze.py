@@ -17,11 +17,35 @@
 
 from idaapi import *
 
+def to_signed(u):
+    if u & 0x80000000:
+        return (u & 0x7fffffff)-0x80000000
+    else:
+        return u
 
 class Operand(object):
 
     REG = 0
     IMM = 1
+
+    REF_JUMP = 1
+    REF_READ = 2
+    REF_WRITE = 4
+
+    REF_BYTE = 8
+    REF_SHORT = 16
+    REF_WORD = 32
+    REF_ABS = 64
+
+    REF_JUMP_ABS = REF_JUMP | REF_ABS
+
+    REF_READ_BYTE = REF_READ | REF_BYTE
+    REF_READ_SHORT = REF_READ | REF_SHORT
+    REF_READ_WORD = REF_READ | REF_WORD
+    REF_WRITE_BYTE = REF_WRITE | REF_BYTE
+    REF_WRITE_SHORT = REF_WRITE | REF_SHORT
+    REF_WRITE_WORD = REF_WRITE | REF_WORD
+
 
     def __init__(self, type, size, bitidx, dt=dt_dword):
         self.type = type
@@ -32,21 +56,32 @@ class Operand(object):
     def bitfield(self, op):
         return (op >> (32 - self.bitidx - self.size)) & (0xffffffff >> (32 - self.size))
 
-    def parse(self, ret, op, cmd = None):
+    def parse(self, ret, op, cmd = None, imm = 0, ref = 0):
         val = self.bitfield(op)
         ret.dtyp = self.dt
         if self.type == Operand.REG:
             ret.type = o_reg
             ret.reg = val
         elif self.type == Operand.IMM:
-            ret.type = o_imm
-            ret.value = val
+            if ref & self.REF_JUMP:
+                ret.type = o_near
+            elif ref & (self.REF_READ | self.REF_WRITE):
+                ret.type = o_mem
+            else:
+                ret.type = o_imm
+            if ref & self.REF_BYTE:
+                ret.dtyp = dt_byte
+            elif ref & self.REF_SHORT:
+                ret.dtyp = dt_word
+            ret.specval = (ref & self.REF_WRITE) | (ref & self.REF_ABS)
+            ret.value = to_signed((imm << 16) | val)
         else:
             raise ValueError('Unhandled operand type')
 
 
 class Instr(object):
 
+    fmt_NONE = []
     fmt_3R = (Operand(Operand.REG, 5, 6), Operand(Operand.REG, 5, 11), Operand(Operand.REG, 5, 16))
     fmt_2R_IMM = (Operand(Operand.REG, 5, 6), Operand(Operand.REG, 5, 11), Operand(Operand.IMM, 16, 16))
     fmt_2R = (Operand(Operand.REG, 5, 6), Operand(Operand.REG, 5, 11))
@@ -57,19 +92,20 @@ class Instr(object):
     fmt_1R = (Operand(Operand.REG, 5, 11),)
     fmt_IMM = (Operand(Operand.IMM, 16, 16),)
 
-    def __init__(self, mnem, opcode, mask, fmt, flags = 0):
+    def __init__(self, mnem, opcode, mask, fmt, flags = 0, ref = 0):
         self.mnem = mnem
         self.opcode = opcode
         self.mask = mask
         self.fmt = fmt
         self.flags = flags
+        self.ref = ref
 
     def match(self, op):
         return (op & self.mask) == self.opcode
 
-    def parseOperands(self, operands, op, cmd = None):
+    def parseOperands(self, operands, op, cmd = None, imm = 0):
         for ret, fmt in zip(operands, self.fmt):
-            fmt.parse(ret, op, cmd)
+            fmt.parse(ret, op, cmd, imm, self.ref)
 
 
 class MicroBlazeProcessor(processor_t):
@@ -120,6 +156,10 @@ class MicroBlazeProcessor(processor_t):
         "a_sizeof_fmt": "size %s",
     }
 
+    #codestart = ['\x']
+    codestart = []
+    retcodes = ['\x08\x00\x0f\xb6'] # rtsd lr, 8
+
     ops = (
         ('add',         0x00000000, 0xfc0007ff, Instr.fmt_3R),
         ('rsub',        0x04000000, 0xfc0007ff, Instr.fmt_3R),
@@ -131,10 +171,14 @@ class MicroBlazeProcessor(processor_t):
         ('rsubkc',      0x1c000000, 0xfc0007ff, Instr.fmt_3R),
         ('cmp',         0x14000001, 0xfc0007ff, Instr.fmt_3R),
         ('cmpu',        0x14000003, 0xfc0007ff, Instr.fmt_3R),
+        # ldi = addi rd, zero, imm
+        ('ldi',         0x20000000, 0xfc1f0000, Instr.fmt_1R2_IMM),
         ('addi',        0x20000000, 0xfc000000, Instr.fmt_2R_IMM),
         ('rsubi',       0x24000000, 0xfc000000, Instr.fmt_2R_IMM),
         ('addic',       0x28000000, 0xfc000000, Instr.fmt_2R_IMM),
         ('rsubic',      0x2c000000, 0xfc000000, Instr.fmt_2R_IMM),
+        # ldik = addik rd, zero, imm
+        ('ldik',        0x30000000, 0xfc1f0000, Instr.fmt_1R2_IMM),
         ('addik',       0x30000000, 0xfc000000, Instr.fmt_2R_IMM),
         ('rsubik',      0x34000000, 0xfc000000, Instr.fmt_2R_IMM),
         ('addikc',      0x38000000, 0xfc000000, Instr.fmt_2R_IMM),
@@ -173,6 +217,8 @@ class MicroBlazeProcessor(processor_t):
         #PUT
         #CGET
         #CPUT
+        ('nop',         0x80000000, 0xffffffff, Instr.fmt_NONE),
+
         ('or',          0x80000000, 0xfc0007ff, Instr.fmt_3R),
         ('and',         0x84000000, 0xfc0007ff, Instr.fmt_3R),
         ('xor',         0x88000000, 0xfc0007ff, Instr.fmt_3R),
@@ -224,26 +270,26 @@ class MicroBlazeProcessor(processor_t):
         ('rtbd',        0xb6400000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP|CF_STOP),
         ('rted',        0xb6800000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP|CF_STOP),
 
-        ('bri',         0xb8000000, 0xffff0000, Instr.fmt_IMM, CF_JUMP|CF_STOP),
-        ('brid',        0xb8100000, 0xffff0000, Instr.fmt_IMM, CF_JUMP|CF_STOP),
-        ('brlid',       0xb8140000, 0xfc1f0000, Instr.fmt_1R2_IMM, CF_JUMP),
-        ('brai',        0xb8080000, 0xffff0000, Instr.fmt_IMM, CF_JUMP|CF_STOP),
-        ('braid',       0xb8180000, 0xffff0000, Instr.fmt_IMM, CF_JUMP|CF_STOP),
-        ('bralid',      0xb81c0000, 0xffff0000, Instr.fmt_1R2_IMM, CF_JUMP),
-        ('brki',        0xb80c0000, 0xfc1f0000, Instr.fmt_1R2_IMM, CF_JUMP),
+        ('bri',         0xb8000000, 0xffff0000, Instr.fmt_IMM, CF_JUMP|CF_STOP, Operand.REF_JUMP),
+        ('brid',        0xb8100000, 0xffff0000, Instr.fmt_IMM, CF_JUMP|CF_STOP, Operand.REF_JUMP),
+        ('brlid',       0xb8140000, 0xfc1f0000, Instr.fmt_1R2_IMM, CF_CALL, Operand.REF_JUMP),
+        ('brai',        0xb8080000, 0xffff0000, Instr.fmt_IMM, CF_JUMP|CF_STOP, Operand.REF_JUMP_ABS),
+        ('braid',       0xb8180000, 0xffff0000, Instr.fmt_IMM, CF_JUMP|CF_STOP, Operand.REF_JUMP_ABS),
+        ('bralid',      0xb81c0000, 0xffff0000, Instr.fmt_1R2_IMM, CF_CALL, Operand.REF_JUMP_ABS),
+        ('brki',        0xb80c0000, 0xfc1f0000, Instr.fmt_1R2_IMM, CF_CALL, Operand.REF_JUMP),
 
-        ('beqi',        0xbc000000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP),
-        ('bnei',        0xbc200000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP),
-        ('blti',        0xbc400000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP),
-        ('blei',        0xbc600000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP),
-        ('bgti',        0xbc800000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP),
-        ('bgei',        0xbca00000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP),
-        ('beqid',       0xbe000000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP),
-        ('bneid',       0xbe200000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP),
-        ('bltid',       0xbe400000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP),
-        ('bleid',       0xbe600000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP),
-        ('bgtid',       0xbe800000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP),
-        ('bgeid',       0xbea00000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP),
+        ('beqi',        0xbc000000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP, Operand.REF_JUMP),
+        ('bnei',        0xbc200000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP, Operand.REF_JUMP),
+        ('blti',        0xbc400000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP, Operand.REF_JUMP),
+        ('blei',        0xbc600000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP, Operand.REF_JUMP),
+        ('bgti',        0xbc800000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP, Operand.REF_JUMP),
+        ('bgei',        0xbca00000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP, Operand.REF_JUMP),
+        ('beqid',       0xbe000000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP, Operand.REF_JUMP),
+        ('bneid',       0xbe200000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP, Operand.REF_JUMP),
+        ('bltid',       0xbe400000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP, Operand.REF_JUMP),
+        ('bleid',       0xbe600000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP, Operand.REF_JUMP),
+        ('bgtid',       0xbe800000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP, Operand.REF_JUMP),
+        ('bgeid',       0xbea00000, 0xffe00000, Instr.fmt_1R_IMM, CF_JUMP, Operand.REF_JUMP),
 
         ('lbu',         0xc0000000, 0xfc0007ff, Instr.fmt_3R),
         ('lhu',         0xc4000000, 0xfc0007ff, Instr.fmt_3R),
@@ -252,11 +298,17 @@ class MicroBlazeProcessor(processor_t):
         ('sh',          0xd4000000, 0xfc0007ff, Instr.fmt_3R),
         ('sw',          0xd8000000, 0xfc0007ff, Instr.fmt_3R),
 
+        ('lbui',        0xe0000000, 0xfc1f0000, Instr.fmt_1R2_IMM, Operand.REF_READ_BYTE),
         ('lbui',        0xe0000000, 0xfc000000, Instr.fmt_2R_IMM),
+        ('lhui',        0xe4000000, 0xfc1f0000, Instr.fmt_1R2_IMM, Operand.REF_READ_SHORT),
         ('lhui',        0xe4000000, 0xfc000000, Instr.fmt_2R_IMM),
+        ('lwi',         0xe8000000, 0xfc1f0000, Instr.fmt_1R2_IMM, Operand.REF_READ_WORD),
         ('lwi',         0xe8000000, 0xfc000000, Instr.fmt_2R_IMM),
+        ('sbi',         0xf0000000, 0xfc1f0000, Instr.fmt_1R2_IMM, Operand.REF_WRITE_BYTE),
         ('sbi',         0xf0000000, 0xfc000000, Instr.fmt_2R_IMM),
+        ('shi',         0xf4000000, 0xfc1f0000, Instr.fmt_1R2_IMM, Operand.REF_WRITE_SHORT),
         ('shi',         0xf4000000, 0xfc000000, Instr.fmt_2R_IMM),
+        ('swi',         0xf8000000, 0xfc1f0000, Instr.fmt_1R2_IMM, Operand.REF_WRITE_WORD),
         ('swi',         0xf8000000, 0xfc000000, Instr.fmt_2R_IMM),
     )
 
@@ -264,6 +316,8 @@ class MicroBlazeProcessor(processor_t):
         processor_t.__init__(self)
         self.__init_instructions()
         self.__init_registers()
+        #for i in range(0, 32, 4):
+        #    self.codestart.append(bytes([i, 0x00, 0x21, 0x30]))
 
     def __init_instructions(self):
         self.instrs_list = []
@@ -283,7 +337,9 @@ class MicroBlazeProcessor(processor_t):
             instr.id = i
 
     def __init_registers(self):
-        self.regNames = ["r%d" % d for d in range(32)]
+        self.regNames = ["zero","sp","r2","r3","r4","r5","r6","r7","r8","r9","r10",
+                "r11","r12","r13","lri","lr","lrt","lre","r18","r19","r20","r21",
+                "r22","r23","r24","r25","r26","r27","r28","r29","r30","r31"]
         self.regNames += ["pc", "msr", "ear", "esr", "ess", "btr", "fsr", "edr",
                 "pid", "zpr", "tlblo", "tlbhi", "tlbx", "tlbsx", "pvr", "CS", "DS"]
         self.reg_ids = {}
@@ -304,15 +360,25 @@ class MicroBlazeProcessor(processor_t):
         op |= self.__pull_op_byte() << 16
         op |= self.__pull_op_byte() << 24
 
+        imm = 0
+
+        if (op & 0xffff0000) == 0xb0000000:
+            # immediate prefix
+            imm = op & 0xffff
+            op = self.__pull_op_byte()
+            op |= self.__pull_op_byte() << 8
+            op |= self.__pull_op_byte() << 16
+            op |= self.__pull_op_byte() << 24
+
         for instr in self.instrs_list:
             if instr.match(op):
-                return instr, op
+                return instr, op, imm
 
-        print("no instruction found matching %08x" % op)
-        return None, op
+        print("unecognized instruction %08x near %08x" % (op, self.cmd.ea))
+        return None, op, None
 
     def ana(self):
-        instr, op = self.__find_instr()
+        instr, op, imm = self.__find_instr()
         if not instr:
             return 0
 
@@ -321,13 +387,22 @@ class MicroBlazeProcessor(processor_t):
         operands = [self.cmd[i] for i in range(6)]
         for o in operands:
             o.type = o_void
-        instr.parseOperands(operands, op, self.cmd)
+        instr.parseOperands(operands, op, self.cmd, imm)
 
         return self.cmd.size
 
     def emu(self):
         feature = self.cmd.get_canon_feature()
-        if feature & CF_JUMP:
+        for i in range(6):
+            op = self.cmd[i]
+            if op.type == o_void:
+                break
+            if op.type == o_mem:
+                ua_add_dref(0, op.value, dr_W if op.specval else dr_R)
+                ua_dodata2(0, op.value, op.dtyp)
+            if op.type == o_near:
+                ua_add_cref(0, op.value + (self.cmd.ea if not op.specval else 0), fl_CN if feature & CF_CALL else fl_JN)
+        if feature & (CF_JUMP|CF_CALL):
             QueueMark(Q_jumps, self.cmd.ea)
         if not feature & CF_STOP:
             ua_add_cref(0, self.cmd.ea + self.cmd.size, fl_F)
@@ -337,14 +412,23 @@ class MicroBlazeProcessor(processor_t):
         if op.type == o_reg:
             out_register(self.regNames[op.reg])
         elif op.type == o_imm:
-            OutValue(op, OOFW_IMM)
+            r = out_name_expr(op, op.value, BADADDR)
+            if not r:
+                OutValue(op, OOFW_IMM)
+        elif op.type in (o_mem, o_near):
+            addr = op.value
+            if op.type == o_near and not op.specval:
+                addr += self.cmd.ea
+            r = out_name_expr(op, addr, BADADDR)
+            if not r:
+                OutLong(addr, 32)
         else:
             return False
         return True
 
     def out(self):
         buf = init_output_buffer(1024)
-        OutMnem(15)
+        OutMnem(10)
 
         instr = self.instrs_list[self.cmd.itype]
 
